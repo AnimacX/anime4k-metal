@@ -1,5 +1,7 @@
 # Anime4KMetal
 
+[English](./README.md) | [简体中文](./README-zh.md)
+
 Native Apple Metal Anime4K image enhancement - Swift Package + CLI.
 
 This package is intentionally independent from CinePlayer. Library APIs operate on
