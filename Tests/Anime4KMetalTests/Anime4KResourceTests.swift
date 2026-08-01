@@ -1,3 +1,4 @@
+import CoreVideo
 import Metal
 import XCTest
 @testable import Anime4KMetal
@@ -43,5 +44,66 @@ final class Anime4KResourceTests: XCTestCase {
         for name in requiredFunctions {
             XCTAssertNotNil(library.makeFunction(name: name), "Missing Metal function \(name)")
         }
+    }
+
+    func testOutputTexturePoolReusesTexturesAndCanBePurged() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal unavailable")
+        }
+        let engine = try Anime4KHostEngine(preferredDevice: device)
+        let input = try makeBGRApixelBuffer(width: 32, height: 24)
+
+        XCTAssertNotNil(engine.enhance(
+            pixelBuffer: input,
+            timestamp: 0,
+            generation: 0,
+            preset: .modeAFast,
+            maxOutputWidth: 64,
+            maxOutputHeight: 48
+        ))
+        let firstSnapshot = engine.debugSnapshot()
+        XCTAssertGreaterThan(firstSnapshot.cachedOutputTextureCount, 0)
+        XCTAssertGreaterThan(firstSnapshot.outputTextureAllocationCount, 0)
+
+        XCTAssertNotNil(engine.enhance(
+            pixelBuffer: input,
+            timestamp: 1,
+            generation: 0,
+            preset: .modeAFast,
+            maxOutputWidth: 64,
+            maxOutputHeight: 48
+        ))
+        let secondSnapshot = engine.debugSnapshot()
+        XCTAssertEqual(
+            secondSnapshot.outputTextureAllocationCount,
+            firstSnapshot.outputTextureAllocationCount,
+            "same-size frames should reuse cached stage output textures"
+        )
+
+        engine.purgeOutputTextureCache()
+        XCTAssertEqual(engine.debugSnapshot().cachedOutputTextureCount, 0)
+    }
+
+    private func makeBGRApixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        ]
+        var buffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            attrs as CFDictionary,
+            &buffer
+        )
+        guard status == kCVReturnSuccess, let buffer else {
+            throw Anime4KError.processingFailed("CVPixelBufferCreate failed: \(status)")
+        }
+        return buffer
     }
 }

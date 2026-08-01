@@ -28,6 +28,13 @@ public final class Anime4KInterpolator: @unchecked Sendable {
         }
     }
 
+    /// 手动释放闲置的 Anime4K stage 输出纹理；不改变 generation 或其他管线缓存。
+    public func purgeOutputTextureCache() {
+        queue.sync {
+            engine.purgeOutputTextureCache()
+        }
+    }
+
     public func enhance(pixelBuffer: CVPixelBuffer) throws -> CVPixelBuffer {
         try enhance(
             pixelBuffer: pixelBuffer,

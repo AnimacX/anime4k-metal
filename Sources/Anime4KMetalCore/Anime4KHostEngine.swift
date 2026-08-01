@@ -19,6 +19,8 @@ public struct Anime4KHostEngineDebugSnapshot: Sendable {
     var p95ProcessMs: Double
     var lastEnabledShaderCount: Int
     var lastError: String?
+    var cachedOutputTextureCount: Int
+    var outputTextureAllocationCount: Int
 }
 
 /// 用于在 @Sendable 闭包中延长 CVPixelBuffer 生命周期的持有者（仅保留引用，不在闭包内访问 buffer）。
@@ -38,6 +40,112 @@ private final class TextureReturnHolder: @unchecked Sendable {
         self.texture = texture
         self.width = width
         self.height = height
+    }
+}
+
+/// Anime4K stage 最终输出使用的私有纹理池。单帧内各 stage 的输出会同时被后续 stage 读取，
+/// 因此以 command buffer 完成为归还边界，而不是在 encode 返回时立即复用。
+private struct OutputTexturePoolKey: Hashable {
+    let width: Int
+    let height: Int
+    let pixelFormat: MTLPixelFormat
+    let usageRawValue: UInt
+    let storageMode: MTLStorageMode
+}
+
+private struct OutputTextureLease {
+    let texture: MTLTexture
+    let key: OutputTexturePoolKey
+    let generation: UInt64
+}
+
+private final class OutputTexturePool: @unchecked Sendable {
+    // 当前最多七个 shader 文件会在同一 command buffer 中产生 stage 输出，留一个余量避免稳态逐帧分配。
+    private static let maximumTexturesPerKey = 8
+
+    private let lock = NSLock()
+    private var textures: [OutputTexturePoolKey: [MTLTexture]] = [:]
+    private var generation: UInt64 = 0
+    private var allocationCount = 0
+
+    func acquire(
+        device: MTLDevice,
+        width: Int,
+        height: Int,
+        pixelFormat: MTLPixelFormat = .rgba16Float,
+        usage: MTLTextureUsage = [.shaderRead, .shaderWrite],
+        storageMode: MTLStorageMode = .private
+    ) -> OutputTextureLease? {
+        let key = OutputTexturePoolKey(
+            width: width,
+            height: height,
+            pixelFormat: pixelFormat,
+            usageRawValue: usage.rawValue,
+            storageMode: storageMode
+        )
+
+        lock.lock()
+        let currentGeneration = generation
+        if var available = textures[key], let texture = available.popLast() {
+            textures[key] = available.isEmpty ? nil : available
+            lock.unlock()
+            return OutputTextureLease(texture: texture, key: key, generation: currentGeneration)
+        }
+        lock.unlock()
+
+        let descriptor = MTLTextureDescriptor()
+        descriptor.width = width
+        descriptor.height = height
+        descriptor.pixelFormat = pixelFormat
+        descriptor.usage = usage
+        descriptor.storageMode = storageMode
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            return nil
+        }
+        texture.label = "Anime4K.stage-output.\(width)x\(height)"
+
+        lock.lock()
+        allocationCount += 1
+        lock.unlock()
+        return OutputTextureLease(texture: texture, key: key, generation: currentGeneration)
+    }
+
+    func recycle(_ lease: OutputTextureLease) {
+        lock.lock()
+        defer { lock.unlock() }
+        // purge 后才完成的旧 command buffer 不得重新填充已经手动清空的池。
+        guard lease.generation == generation else {
+            return
+        }
+        var available = textures[lease.key] ?? []
+        guard available.count < Self.maximumTexturesPerKey else {
+            return
+        }
+        available.append(lease.texture)
+        textures[lease.key] = available
+    }
+
+    func purge() {
+        lock.lock()
+        generation &+= 1
+        textures.removeAll()
+        lock.unlock()
+    }
+
+    func debugSnapshot() -> (cachedTextureCount: Int, allocationCount: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (textures.values.reduce(0) { $0 + $1.count }, allocationCount)
+    }
+}
+
+private final class OutputTextureReturnHolder: @unchecked Sendable {
+    let pool: OutputTexturePool
+    let lease: OutputTextureLease
+
+    init(pool: OutputTexturePool, lease: OutputTextureLease) {
+        self.pool = pool
+        self.lease = lease
     }
 }
 
@@ -156,6 +264,7 @@ public final class Anime4KHostEngine: @unchecked Sendable {
     private var loggedPipelineKeys: Set<PipelineKey> = []
     private var outputPoolKey: OutputPoolKey?
     private var outputPool: CVPixelBufferPool?
+    private let outputTexturePool = OutputTexturePool()
     private let intermediatePoolLock = NSLock()
     private var intermediateTexturePool: [String: [MTLTexture]] = [:]
     private var vtTransferSession: VTPixelTransferSession?
@@ -184,6 +293,7 @@ public final class Anime4KHostEngine: @unchecked Sendable {
 
     #if DEBUG
         public func debugSnapshot() -> Anime4KHostEngineDebugSnapshot {
+            let outputTextureSnapshot = outputTexturePool.debugSnapshot()
             stateLock.lock()
             defer { stateLock.unlock() }
             return Anime4KHostEngineDebugSnapshot(
@@ -195,7 +305,9 @@ public final class Anime4KHostEngine: @unchecked Sendable {
                 resetCount: stats.resetCount,
                 p95ProcessMs: stats.p95(),
                 lastEnabledShaderCount: stats.lastEnabledShaderCount,
-                lastError: stats.lastError
+                lastError: stats.lastError,
+                cachedOutputTextureCount: outputTextureSnapshot.cachedTextureCount,
+                outputTextureAllocationCount: outputTextureSnapshot.allocationCount
             )
         }
     #endif
@@ -277,6 +389,7 @@ public final class Anime4KHostEngine: @unchecked Sendable {
         intermediatePoolLock.lock()
         intermediateTexturePool.removeAll()
         intermediatePoolLock.unlock()
+        purgeOutputTextureCache()
 
         if let textureCache {
             CVMetalTextureCacheFlush(textureCache, 0)
@@ -284,6 +397,12 @@ public final class Anime4KHostEngine: @unchecked Sendable {
         #if DEBUG
             anime4kDebugLog("Anime4K engine reset count=\(resetCount)")
         #endif
+    }
+
+    /// 手动释放闲置的 Anime4K stage 输出纹理。正在执行的 command buffer 可继续使用其纹理，
+    /// 但完成后不会再把 purge 前借出的纹理归还至池中。
+    public func purgeOutputTextureCache() {
+        outputTexturePool.purge()
     }
 
     public func enhance(
@@ -646,6 +765,7 @@ public final class Anime4KHostEngine: @unchecked Sendable {
                     name: stage.name,
                     glsl: stage.glsl,
                     centerResizePSO: centerResizePSO,
+                    outputTexturePool: outputTexturePool,
                     device: device
                 )
                 processors.append(processor)
@@ -1490,6 +1610,7 @@ private final class Anime4KProcessor {
     let shaders: [MPVShader]
     let libraries: [MTLLibrary]
     let centerResizePSO: MTLComputePipelineState
+    let outputTexturePool: OutputTexturePool
 
     var enabledShaders: [MPVShader] = []
     var pipelineStates: [MTLComputePipelineState] = []
@@ -1514,6 +1635,7 @@ private final class Anime4KProcessor {
         name: String,
         glsl: String,
         centerResizePSO: MTLComputePipelineState,
+        outputTexturePool: OutputTexturePool,
         device: MTLDevice
     ) throws {
         self.name = name
@@ -1522,6 +1644,7 @@ private final class Anime4KProcessor {
             try device.makeLibrary(source: shader.metalCode, options: nil)
         }
         self.centerResizePSO = centerResizePSO
+        self.outputTexturePool = outputTexturePool
     }
 
     func compileIfNeeded(
@@ -1628,13 +1751,21 @@ private final class Anime4KProcessor {
         textureMap["MAIN"] = input
         textureMap["NATIVE"] = input
 
-        let outputDesc = MTLTextureDescriptor()
-        outputDesc.width = Int(outputW)
-        outputDesc.height = Int(outputH)
-        outputDesc.pixelFormat = .rgba16Float
-        outputDesc.usage = [.shaderRead, .shaderWrite]
-        outputDesc.storageMode = .private
-        textureMap["output"] = device.makeTexture(descriptor: outputDesc)
+        guard let outputLease = outputTexturePool.acquire(
+            device: device,
+            width: Int(outputW),
+            height: Int(outputH)
+        ) else {
+            throw Anime4KEncoderError.encoderFail("failed to allocate stage output texture")
+        }
+        textureMap["output"] = outputLease.texture
+        var shouldRecycleOutputImmediately = true
+        defer {
+            textureMap.removeValue(forKey: "output")
+            if shouldRecycleOutputImmediately {
+                outputTexturePool.recycle(outputLease)
+            }
+        }
 
         // 单 encoder 跑完所有 stage，减少 encoder 创建/提交开销
         guard let encoder = cmdBuf.makeComputeCommandEncoder() else {
@@ -1723,10 +1854,12 @@ private final class Anime4KProcessor {
             )
         }
 
-        guard let output = textureMap["output"] else {
-            throw Anime4KEncoderError.encoderFail("missing output texture")
+        let returnHolder = OutputTextureReturnHolder(pool: outputTexturePool, lease: outputLease)
+        cmdBuf.addCompletedHandler { [returnHolder] _ in
+            returnHolder.pool.recycle(returnHolder.lease)
         }
-        return output
+        shouldRecycleOutputImmediately = false
+        return outputLease.texture
     }
 
     private func evaluateWhen(_ when: String) -> Bool {
