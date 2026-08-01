@@ -405,6 +405,23 @@ public final class Anime4KHostEngine: @unchecked Sendable {
         outputTexturePool.purge()
     }
 
+    /// 释放所有可重建的 Anime4K 与 VideoToolbox 资源。
+    ///
+    /// 此方法会等待正在进行的增强完成，因此仅应在停止播放、替换媒体、长期关闭增强、
+    /// 进入后台或收到内存压力时调用，而不适用于 seek 或 pause/resume。
+    public func purgeResources() {
+        processingLock.lock()
+        defer { processingLock.unlock() }
+
+        reset()
+        if let vtTransferSession {
+            VTPixelTransferSessionInvalidate(vtTransferSession)
+        }
+        vtTransferSession = nil
+        bgraPool = nil
+        bgraPoolKey = nil
+    }
+
     public func enhance(
         pixelBuffer: CVPixelBuffer,
         timestamp: Int64,

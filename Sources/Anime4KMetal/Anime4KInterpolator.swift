@@ -35,6 +35,15 @@ public final class Anime4KInterpolator: @unchecked Sendable {
         }
     }
 
+    /// 释放可重建的 Anime4K 与 VideoToolbox 资源。
+    /// 仅在停止播放、替换媒体、长期关闭增强或内存压力时调用；seek 和 pause/resume 不应调用。
+    public func purgeResources() {
+        queue.sync {
+            generation += 1
+            engine.purgeResources()
+        }
+    }
+
     public func enhance(pixelBuffer: CVPixelBuffer) throws -> CVPixelBuffer {
         try enhance(
             pixelBuffer: pixelBuffer,
