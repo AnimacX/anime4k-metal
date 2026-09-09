@@ -64,6 +64,7 @@ public final class Anime4KHostEngine: @unchecked Sendable {
         let programName: String
         let stageFiles: [String]
         let stages: [Anime4KProcessor]
+        let workspace: Anime4KSharedWorkspace
     }
 
     private enum BypassReason: String {
@@ -415,22 +416,34 @@ public final class Anime4KHostEngine: @unchecked Sendable {
                 useOutputSizeCap: useOutputSizeCap
             )
             var enhancedTexture = inputTexture
+            pipeline.workspace.prepare(width: compileOutput.width, height: compileOutput.height)
             var totalEnabledShaderCount = 0
+            var activeStages: [Anime4KProcessor] = []
+            var stageWidth = enhancedTexture.width
+            var stageHeight = enhancedTexture.height
             for stage in pipeline.stages {
                 try stage.compileIfNeeded(
                     device: device,
                     videoInW: width,
                     videoInH: height,
-                    textureInW: enhancedTexture.width,
-                    textureInH: enhancedTexture.height,
+                    textureInW: stageWidth,
+                    textureInH: stageHeight,
                     displayOutW: compileOutput.width,
                     displayOutH: compileOutput.height
                 )
                 totalEnabledShaderCount += stage.enabledShaderCount
+                if stage.enabledShaderCount > 0 {
+                    activeStages.append(stage)
+                    stageWidth = Int(stage.outputW)
+                    stageHeight = Int(stage.outputH)
+                }
+            }
+            for (index, stage) in activeStages.enumerated() {
                 enhancedTexture = try stage.encodeIntermediate(
                     device,
                     cmdBuf: commandBuffer,
-                    input: enhancedTexture
+                    input: enhancedTexture,
+                    finalOutput: !abCompareEnabled && index == activeStages.count - 1 ? outputTexture : nil
                 )
             }
             #if DEBUG
@@ -470,7 +483,7 @@ public final class Anime4KHostEngine: @unchecked Sendable {
                         return nil
                     }
                 }
-            } else if !encodeBestCompose(
+            } else if enhancedTexture !== outputTexture && !encodeBestCompose(
                 commandBuffer: commandBuffer,
                 inputTexture: enhancedTexture,
                 outputTexture: composeTargetTexture
@@ -610,6 +623,14 @@ public final class Anime4KHostEngine: @unchecked Sendable {
         preset: Anime4KPreset,
         device: MTLDevice
     ) -> Anime4KPipeline? {
+        // 命中管线后无需重新读取包内 GLSL；重置和尺寸变化仍走原有创建流程。
+        stateLock.lock()
+        if let existing = pipelines[key] {
+            stateLock.unlock()
+            return existing
+        }
+        stateLock.unlock()
+
         let shaderProgram: Anime4KShaderProgram
         do {
             shaderProgram = try Anime4KShaderCatalog.program(for: preset)
@@ -617,13 +638,6 @@ public final class Anime4KHostEngine: @unchecked Sendable {
             setLastError("shader catalog failed: \(error.localizedDescription)")
             return nil
         }
-
-        stateLock.lock()
-        if let existing = pipelines[key] {
-            stateLock.unlock()
-            return existing
-        }
-        stateLock.unlock()
 
         guard let centerResizePSO else {
             return nil
@@ -641,12 +655,14 @@ public final class Anime4KHostEngine: @unchecked Sendable {
 
             var processors: [Anime4KProcessor] = []
             processors.reserveCapacity(stages.count)
+            let workspace = Anime4KSharedWorkspace()
             for stage in stages {
                 let processor = try Anime4KProcessor(
                     name: stage.name,
                     glsl: stage.glsl,
                     centerResizePSO: centerResizePSO,
-                    device: device
+                    device: device,
+                    workspace: workspace
                 )
                 processors.append(processor)
             }
@@ -654,7 +670,8 @@ public final class Anime4KHostEngine: @unchecked Sendable {
             let pipeline = Anime4KPipeline(
                 programName: shaderProgram.name,
                 stageFiles: shaderProgram.stageFiles,
-                stages: processors
+                stages: processors,
+                workspace: workspace
             )
             stateLock.lock()
             pipelines[key] = pipeline
@@ -1485,10 +1502,29 @@ private struct YUVConversionParams {
     var isVideoRange: UInt32
 }
 
+/// 同一条串行 shader 链的组间工作区；组输出不进入此池，避免覆盖下一组输入。
+private final class Anime4KSharedWorkspace {
+    private var textures: [String: [MTLTexture]] = [:]
+    private var outputSize: (Int, Int)?
+
+    func prepare(width: Int, height: Int) {
+        guard outputSize?.0 != width || outputSize?.1 != height else { return }
+        textures.removeAll()
+        outputSize = (width, height)
+    }
+
+    func texture(device: MTLDevice, descriptor: MTLTextureDescriptor, index: Int) -> MTLTexture? {
+        let key = "\(descriptor.width)x\(descriptor.height)"
+        if let entries = textures[key], index < entries.count { return entries[index] }
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+        textures[key, default: []].append(texture)
+        return texture
+    }
+}
+
 private final class Anime4KProcessor {
     let name: String
     let shaders: [MPVShader]
-    let libraries: [MTLLibrary]
     let centerResizePSO: MTLComputePipelineState
 
     var enabledShaders: [MPVShader] = []
@@ -1505,6 +1541,11 @@ private final class Anime4KProcessor {
     private var compiledSignature: String = ""
     /// 按 mag/min filter 缓存 sampler，避免每帧每 stage 重复创建（仅 linear / nearest 两种）。
     private var samplerCache: [String: MTLSamplerState] = [:]
+    /// 同一组内每个写入 stage 独占纹理；后续组可复用已结束组的工作区。
+    private let workspace: Anime4KSharedWorkspace
+    private var frameOutputTexture: MTLTexture?
+    private var directOutputPSO: MTLComputePipelineState?
+    private var fusedPairs: [Int: MTLComputePipelineState] = [:]
 
     var enabledShaderCount: Int {
         enabledShaders.count
@@ -1514,13 +1555,12 @@ private final class Anime4KProcessor {
         name: String,
         glsl: String,
         centerResizePSO: MTLComputePipelineState,
-        device: MTLDevice
+        device: MTLDevice,
+        workspace: Anime4KSharedWorkspace
     ) throws {
         self.name = name
+        self.workspace = workspace
         shaders = try MPVShader.parse(glsl)
-        libraries = try shaders.map { shader in
-            try device.makeLibrary(source: shader.metalCode, options: nil)
-        }
         self.centerResizePSO = centerResizePSO
     }
 
@@ -1544,6 +1584,9 @@ private final class Anime4KProcessor {
         pipelineStates.removeAll()
         textureMap.removeAll()
         sizeMap.removeAll()
+        frameOutputTexture = nil
+        directOutputPSO = nil
+        fusedPairs.removeAll()
 
         self.textureInW = Float(textureInW)
         self.textureInH = Float(textureInH)
@@ -1558,7 +1601,7 @@ private final class Anime4KProcessor {
         sizeMap["NATIVE"] = (Float(videoInW), Float(videoInH))
         sizeMap["OUTPUT"] = (displayActualW, displayActualH)
 
-        for (index, shader) in shaders.enumerated() {
+        for shader in shaders {
             if let when = shader.when, evaluateWhen(when) == false {
                 continue
             }
@@ -1577,11 +1620,27 @@ private final class Anime4KProcessor {
             if let save = shader.save, save != "MAIN" {
                 sizeMap[save] = (outputW, outputH)
             }
-            let library = libraries[index]
-            guard let function = library.makeFunction(name: shader.functionName) else {
-                throw Anime4KEncoderError.encoderFail("missing function \(shader.functionName)")
+        }
+        var pairIndex = 0
+        while pairIndex < enabledShaders.count {
+            // 只编译实际采用的路径；融合失败才编译原始 pass，避免首次处理重复编译。
+            if pairIndex + 1 < enabledShaders.count,
+               let source = enabledShaders[pairIndex].fusedMetalCode(with: enabledShaders[pairIndex + 1]),
+               let library = try? device.makeLibrary(source: source, options: nil),
+               let function = library.makeFunction(name: "fusedConvolutions"),
+               let pipeline = try? device.makeComputePipelineState(function: function) {
+                fusedPairs[pairIndex] = pipeline
+                pipelineStates.append(contentsOf: [pipeline, pipeline])
+                pairIndex += 2
+            } else {
+                let shader = enabledShaders[pairIndex]
+                let library = try device.makeLibrary(source: shader.metalCode, options: nil)
+                guard let function = library.makeFunction(name: shader.functionName) else {
+                    throw Anime4KEncoderError.encoderFail("missing function \(shader.functionName)")
+                }
+                try pipelineStates.append(device.makeComputePipelineState(function: function))
+                pairIndex += 1
             }
-            try pipelineStates.append(device.makeComputePipelineState(function: function))
         }
     }
 
@@ -1614,19 +1673,32 @@ private final class Anime4KProcessor {
     func encodeIntermediate(
         _ device: MTLDevice,
         cmdBuf: MTLCommandBuffer,
-        input: MTLTexture
+        input: MTLTexture,
+        finalOutput: MTLTexture? = nil
     ) throws -> MTLTexture {
-        try encode(device, cmdBuf: cmdBuf, input: input)
+        try encode(device, cmdBuf: cmdBuf, input: input, finalOutput: finalOutput)
     }
 
-    private func encode(_ device: MTLDevice, cmdBuf: MTLCommandBuffer, input: MTLTexture) throws
+    private func encode(_ device: MTLDevice, cmdBuf: MTLCommandBuffer, input: MTLTexture, finalOutput: MTLTexture? = nil) throws
         -> MTLTexture
     {
         guard !enabledShaders.isEmpty else {
             return input
         }
+        // 每帧重建名字到资源的绑定，避免首个 stage 读到上一帧末尾的同名输出。
+        textureMap.removeAll(keepingCapacity: true)
         textureMap["MAIN"] = input
         textureMap["NATIVE"] = input
+        let direct = finalOutput.flatMap { texture in
+            texture.width == Int(outputW) && texture.height == Int(outputH) ? texture : nil
+        }
+        if direct != nil, directOutputPSO == nil, let shader = enabledShaders.last {
+            let library = try device.makeLibrary(source: shader.makeMetalCode(narrowOutput: true), options: nil)
+            guard let function = library.makeFunction(name: shader.functionName) else {
+                throw Anime4KEncoderError.encoderFail("missing direct output function")
+            }
+            directOutputPSO = try device.makeComputePipelineState(function: function)
+        }
 
         let outputDesc = MTLTextureDescriptor()
         outputDesc.width = Int(outputW)
@@ -1634,7 +1706,11 @@ private final class Anime4KProcessor {
         outputDesc.pixelFormat = .rgba16Float
         outputDesc.usage = [.shaderRead, .shaderWrite]
         outputDesc.storageMode = .private
-        textureMap["output"] = device.makeTexture(descriptor: outputDesc)
+        if direct == nil, frameOutputTexture == nil {
+            frameOutputTexture = device.makeTexture(descriptor: outputDesc)
+        }
+        textureMap["output"] = direct ?? frameOutputTexture
+        var workspaceIndices: [String: Int] = [:]
 
         // 单 encoder 跑完所有 stage，减少 encoder 创建/提交开销
         guard let encoder = cmdBuf.makeComputeCommandEncoder() else {
@@ -1642,7 +1718,9 @@ private final class Anime4KProcessor {
         }
         defer { encoder.endEncoding() }
 
+        var skippedPairIndex: Int?
         for (index, shader) in enabledShaders.enumerated() {
+            if index == skippedPairIndex { continue }
             var outputW = textureInW
             var outputH = textureInH
             if let hooked = shader.hook {
@@ -1655,7 +1733,7 @@ private final class Anime4KProcessor {
                 outputH = (sizeMap[heightMultiplier.0]?.1 ?? outputH) * heightMultiplier.1
             }
 
-            let pipelineState = pipelineStates[index]
+            let pipelineState = fusedPairs[index] ?? (direct != nil && index == enabledShaders.count - 1 ? directOutputPSO! : pipelineStates[index])
             encoder.setComputePipelineState(pipelineState)
 
             let useNearest = outputW >= textureInW
@@ -1704,12 +1782,33 @@ private final class Anime4KProcessor {
                 desc.pixelFormat = .rgba16Float
                 desc.usage = [.shaderRead, .shaderWrite]
                 desc.storageMode = .private
-                textureMap[shader.outputTextureName] = device.makeTexture(descriptor: desc)
+                let key = "\(desc.width)x\(desc.height)"
+                let slot = workspaceIndices[key, default: 0]
+                workspaceIndices[key] = slot + 1
+                textureMap[shader.outputTextureName] = workspace.texture(
+                    device: device, descriptor: desc, index: slot
+                )
             }
             guard let outputTex = textureMap[shader.outputTextureName] else {
                 throw Anime4KEncoderError.encoderFail("failed to allocate output texture")
             }
             encoder.setTexture(outputTex, index: shader.inputTextureNames.count)
+
+            if fusedPairs[index] != nil {
+                let next = enabledShaders[index + 1]
+                let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: Int(outputW), height: Int(outputH), mipmapped: false)
+                descriptor.usage = [.shaderRead, .shaderWrite]
+                descriptor.storageMode = .private
+                let key = "\(descriptor.width)x\(descriptor.height)"
+                let slot = workspaceIndices[key, default: 0]
+                workspaceIndices[key] = slot + 1
+                guard let second = workspace.texture(device: device, descriptor: descriptor, index: slot) else {
+                    throw Anime4KEncoderError.encoderFail("failed to allocate second convolution output")
+                }
+                textureMap[next.outputTextureName] = second
+                encoder.setTexture(second, index: shader.inputTextureNames.count + 1)
+                skippedPairIndex = index + 1
+            }
 
             let (w, h) = Anime4KHostEngine.threadgroupSize2D(for: pipelineState)
             let threadsPerThreadgroup = MTLSizeMake(w, h, 1)
@@ -1832,7 +1931,45 @@ private struct MPVShader {
         return "output"
     }
 
-    nonisolated var metalCode: String {
+    nonisolated var metalCode: String { makeMetalCode(narrowOutput: false) }
+
+    // 只合并共享输入的相邻卷积；保留原采样、运算顺序和两张 half 输出。
+    nonisolated func fusedMetalCode(with next: MPVShader) -> String? {
+        guard name.contains("-Conv-"), next.name.contains("-Conv-"),
+              hook == next.hook, binds == next.binds,
+              inputTextureNames == next.inputTextureNames,
+              width?.0 == next.width?.0, width?.1 == next.width?.1,
+              height?.0 == next.height?.0, height?.1 == next.height?.1,
+              outputTextureName != "output", next.outputTextureName != "output",
+              outputTextureName != next.outputTextureName,
+              !inputTextureNames.contains(outputTextureName),
+              !inputTextureNames.contains(next.outputTextureName),
+              code.filter({ $0.hasPrefix("#define") }) == next.code.filter({ $0.hasPrefix("#define") }) else { return nil }
+        let first = metalCode, second = next.metalCode
+        guard let firstEnd = first.range(of: "kernel void "),
+              let secondStart = second.range(of: "vec4 hook("),
+              let secondEnd = second.range(of: "kernel void ") else { return nil }
+        var result = String(first[..<firstEnd.lowerBound]).replacingOccurrences(of: "hook(", with: "firstHook(")
+        result += String(second[secondStart.lowerBound..<secondEnd.lowerBound]).replacingOccurrences(of: "hook(", with: "secondHook(")
+        var arguments = inputTextureNames.enumerated().map {
+            "texture2d<float, access::sample> \($0.element) [[texture(\($0.offset))]]"
+        }
+        arguments.append("texture2d<float, access::write> output [[texture(\(inputTextureNames.count))]]")
+        arguments.append("texture2d<float, access::write> secondOutput [[texture(\(inputTextureNames.count + 1))]]")
+        arguments.append("uint2 gid [[thread_position_in_grid]]")
+        arguments.append("sampler textureSampler [[sampler(0)]]")
+        let call = (["mtlPos", "textureSampler"] + inputTextureNames).joined(separator: ", ")
+        result += """
+        kernel void fusedConvolutions(\(arguments.joined(separator: ", "))) {
+            float2 mtlPos = float2(gid) / (float2(output.get_width(), output.get_height()) - float2(1, 1));
+            output.write(firstHook(\(call)), gid);
+            secondOutput.write(secondHook(\(call)), gid);
+        }
+        """
+        return result
+    }
+
+    nonisolated func makeMetalCode(narrowOutput: Bool) -> String {
         var header = """
         #include <metal_stdlib>
         using namespace metal;
@@ -1845,6 +1982,29 @@ private struct MPVShader {
 
         """
 
+        if narrowOutput {
+            // 复现 RGBA16Float 写回的 RTZ 边界，再交给 UNORM 输出量化。
+            header += """
+            inline float narrowComponent(float value) {
+                uint bits = as_type<uint>(value);
+                ushort sign = ushort((bits >> 16) & 0x8000u);
+                uint magnitude = bits & 0x7fffffffu;
+                int exponent = int(magnitude >> 23) - 127 + 15;
+                uint mantissa = magnitude & 0x007fffffu;
+                ushort result;
+                if (exponent >= 31) result = ushort(sign | 0x7bffu);
+                else if (exponent <= 0) {
+                    if (exponent < -10) result = sign;
+                    else result = ushort(sign | ushort((mantissa | 0x00800000u) >> uint(14 - exponent)));
+                } else result = ushort(sign | ushort(uint(exponent) << 10) | ushort(mantissa >> 13));
+                return float(as_type<half>(result));
+            }
+            inline float4 narrowResult(float4 value) {
+                return float4(narrowComponent(value.x), narrowComponent(value.y), narrowComponent(value.z), narrowComponent(value.w));
+            }
+
+            """
+        }
         for bind in binds {
             header += """
             #define \(bind)_pos mtlPos
@@ -1928,7 +2088,7 @@ private struct MPVShader {
         body += """
         kernel void \(functionName)(\(entryArgs)) {
             float2 mtlPos = float2(gid) / (float2(output.get_width(), output.get_height()) - float2(1, 1));
-            output.write(hook(\(hookCallArgs)), gid);
+            output.write(\(narrowOutput ? "narrowResult(hook(\(hookCallArgs)))" : "hook(\(hookCallArgs))"), gid);
         }
 
         """
