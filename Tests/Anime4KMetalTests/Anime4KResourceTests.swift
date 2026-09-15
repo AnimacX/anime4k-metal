@@ -82,6 +82,26 @@ final class Anime4KResourceTests: XCTestCase {
 
         engine.purgeOutputTextureCache()
         XCTAssertEqual(engine.debugSnapshot().cachedOutputTextureCount, 0)
+
+        XCTAssertNotNil(engine.enhance(
+            pixelBuffer: input,
+            timestamp: 2,
+            generation: 0,
+            preset: .modeAFast,
+            maxOutputWidth: 64,
+            maxOutputHeight: 48
+        ))
+        let rebuiltSnapshot = engine.debugSnapshot()
+        XCTAssertGreaterThan(rebuiltSnapshot.cachedOutputTextureCount, 0)
+        XCTAssertGreaterThan(
+            rebuiltSnapshot.outputTextureAllocationCount,
+            secondSnapshot.outputTextureAllocationCount
+        )
+        XCTAssertEqual(
+            rebuiltSnapshot.compileCount,
+            secondSnapshot.compileCount,
+            "purging textures should preserve compiled shader pipelines"
+        )
     }
 
     func testPurgeResourcesAllowsSubsequentEnhancement() throws {
